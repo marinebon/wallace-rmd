@@ -1,0 +1,297 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+Please find below the R code history from your *Wallace* v1.0.6.3
+session.
+
+You can reproduce your session results by running this R Markdown file
+in RStudio.
+
+Each code block is called a “chunk”, and you can run them either
+one-by-one or all at once by choosing an option in the “Run” menu at the
+top-right corner of the “Source” pane in RStudio.
+
+For more detailed information see
+<a href="http://rmarkdown.rstudio.com" class="uri">http://rmarkdown.rstudio.com</a>).
+
+### Package installation
+
+Wallace uses the following R packages that must be installed and loaded
+before starting.
+
+```{r}
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+shelf(spocc, spThin, dismo, rgeos, ENMeval, dplyr)
+```
+
+Wallace also includes several functions developed to help integrate
+different packages and some additional functionality. For this reason,
+it is necessary to load the file `functions.R`, The function
+`system.file()` finds this script, and `source()` loads it.
+
+```{r}
+source(system.file('shiny/funcs', 'functions.R', package = 'wallace'))
+```
+
+Record of analysis for *Sula sula*.
+-------------------------------------
+
+### Obtain Occurrence Data
+
+The search for occurrences was limited to 100 records. Obtain occurrence
+records of the selected species from the gbif database.
+
+```{r}
+sp <- "Sula sula"
+
+# query selected database for occurrence records
+results <- spocc::occ(query = sp, from = "gbif", limit = 100, has_coords = TRUE)
+# retrieve data table from spocc object
+results.data <- results[["gbif"]]$data[[formatSpName(sp)]]
+# remove rows with duplicate coordinates
+occs.dups <- duplicated(results.data[c('longitude', 'latitude')])
+occs <- results.data[!occs.dups,]
+# make sure latitude and longitude are numeric (sometimes they are characters)
+occs$latitude <- as.numeric(occs$latitude)
+occs$longitude <- as.numeric(occs$longitude)
+# give all records a unique ID
+occs$occID <- row.names(occs)
+```
+
+### Process Occurrence Data
+
+The following code recreates the polygon used to select occurrences to
+keep in the analysis.
+
+```{r}
+# selCoords <- data.frame(x = c(-137.7221, -121.6379, -123.1321, -118.298, -96.0614, -89.5574, -111.1788, -132.7123, -137.7221), y = c(61.228, 39.4362, 35.2456, 31.7282, 32.6209, 41.9023, 57.5158, 61.939, 61.228))
+# selPoly <- sp::SpatialPolygons(list(sp::Polygons(list(sp::Polygon(selCoords)), ID=1)))
+# plot(selPoly)
+
+selPoly_buf_dd <- 0.5
+
+occs.xy <- occs[c('longitude', 'latitude')]
+sp::coordinates(occs.xy) <- ~ longitude + latitude
+selPoly <- mcp(occs.xy)
+selPoly <- rgeos::gBuffer(selPoly, width = selPoly_buf_dd)
+
+occs.xy <- occs[c('longitude', 'latitude')]
+sp::coordinates(occs.xy) <- ~ longitude + latitude
+intersect <- sp::over(occs.xy, selPoly)
+intersect.rowNums <- as.numeric(which(!(is.na(intersect))))
+occs <- occs[intersect.rowNums, ]
+```
+
+### Obtain Environmental Data
+
+Originally, used WorldClim
+(<a href="http://www.worldclim.org/" class="uri">http://www.worldclim.org/</a>)
+bioclimatic dataset at resolution of 10 arcmin.
+
+#### sdmpredictors
+
+* [sdmpredictors quickstart guide](https://cran.r-project.org/web/packages/sdmpredictors/vignettes/quickstart.html)
+
+```{r}
+shelf(DT, here, sdmpredictors) # ?sdmpredictors
+
+dir_data <- here("data")
+dir.create(dir_data, showWarnings = F)
+
+datasets <- list_datasets(terrestrial = FALSE, marine = TRUE)
+layers <- list_layers(datasets)
+
+# TODO: check out MARSPEC layers
+lyrs <- layers %>% 
+  filter(
+    dataset_code == "Bio-ORACLE",
+    derivation == "mean")
+datatable(lyrs)
+
+# get layers
+options(sdmpredictors_datadir= dir_data)
+envs <- load_layers(lyrs)
+
+# set cell resolution
+envRes <- res(envs)[1] # 0.1666667
+
+# get WorldClim bioclimatic variable rasters
+# envs <- raster::getData(name = "worldclim", var = "bio", res = 10, path = dir_data)
+# change names rasters variables
+# envRes <- 10
+# if (envRes == 0.5) {
+#   i <- grep('_', names(envs))
+#   editNames <- sapply(strsplit(names(envs)[i], '_'), function(x) x[1])
+#   names(envs)[i] <- editNames
+# }
+# i <- grep('bio[0-9]$', names(envs))
+# editNames <- paste('bio', sapply(strsplit(names(envs)[i], 'bio'), function(x) x[2]), sep='0')
+# names(envs)[i] <- editNames
+# subset by those variables selected
+# envs <- envs[[c('bio01', 'bio02', 'bio03', 'bio04', 'bio05', 'bio06', 'bio07', 'bio08', 'bio09', 'bio10', 'bio11', 'bio12', 'bio13', 'bio14', 'bio15', 'bio16', 'bio17', 'bio18', 'bio19')]]
+```
+
+* [Modeling methods — R Spatial](https://rspatial.org/raster/sdm/6_sdm_methods.html)
+
+```{r}
+shelf(sf)
+
+datatable(occs)
+
+occs_pts <- occs %>% 
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    remove = F,
+    crs = 4326) %>% 
+  mutate(
+    presence = T)
+
+occs_bb <- st_bbox(occs_pts)
+
+plot(envs[[1]])
+plot(occs_pts["presence"], add = T)
+```
+
+
+```{r}
+# extract environmental values at occ grid cells
+locs.vals <- raster::extract(envs[[1]], occs[, c('longitude', 'latitude')])
+# remove occs without environmental values
+occs <- occs[!is.na(locs.vals), ]  # removed 2
+```
+
+### Process Environmental Data
+
+Background selection technique chosen as Minimum Convex Polygon.
+
+```{r}
+occs.xy <- occs[c('longitude', 'latitude')]
+sp::coordinates(occs.xy) <- ~ longitude + latitude
+bgExt <- mcp(occs.xy)
+```
+
+Buffer size of the study extent polygon defined as 0.5 degrees.
+
+```{r}
+bgExt <- rgeos::gBuffer(bgExt, width = 0.5)
+```
+
+Mask environmental variables by Minimum Convex Polygon, and take a
+random sample of background values from the study extent. As the sample
+is random, your results may be different than those in the session. If
+there seems to be too much variability in these background samples, try
+increasing the number from 10,000 to something higher (e.g. 50,000 or
+100,000). The better your background sample, the less variability you’ll
+have between runs.
+
+```{r}
+# crop the environmental rasters by the background extent shape
+envsBgCrop <- raster::crop(envs, bgExt)
+# mask the background extent shape from the cropped raster
+envsBgMsk <- raster::mask(envsBgCrop, bgExt)
+# sample random background points
+bg.xy <- dismo::randomPoints(envsBgMsk, 10000)
+# convert matrix output to data frame
+bg.xy <- as.data.frame(bg.xy)  
+```
+
+### Partition Occurrence Data
+
+Occurrence data is now partitioned for cross-validation, a method that
+iteratively builds a model on all but one group and evaluates that model
+on the left-out group.
+
+For example, if the data is partitioned into 3 groups A, B, and C, a
+model is first built with groups A and B and is evaluated on C. This is
+repeated by building a model with B and C and evaluating on A, and so on
+until all combinations are done.
+
+Cross-validation operates under the assumption that the groups are
+independent of each other, which may or may not be a safe assumption for
+your dataset. Spatial partitioning is one way to ensure more
+independence between groups.
+
+You selected to partition your occurrence data by the method.
+
+```{r}
+occs.xy <- occs[c('longitude', 'latitude')]
+group.data <- ENMeval::get.randomkfold(occ=occs.xy, bg.coords=bg.xy, kfolds=5)
+```
+
+```{r}
+# pull out the occurrence and background partition group numbers from the list
+occs.grp <- group.data[[1]]
+bg.grp <- group.data[[2]]
+```
+
+### Build and Evaluate Niche Model
+
+You selected the maxent model.
+
+```{r}
+shelf(glue, readr, stringr)
+
+# define the vector of regularization multipliers to test
+rms <- seq(1, 2, 1)
+
+# iterate model building over all chosen parameter settings
+mx_rds <- here(glue("data/{sp %>% str_replace_all(' ', '_')}.maxent.rds"))
+
+if (!file.exists(mx_rds)){
+  e <- ENMeval::ENMevaluate(
+    occs.xy, envsBgMsk, bg.coords = bg.xy, RMvalues = rms, fc = c('L', 'LQ'), 
+    method = 'user', occs.grp, bg.grp, clamp = TRUE, algorithm = "maxent.jar")
+  write_rds(e, mx_rds)
+} else {
+  e <- read_rds(mx_rds)
+}
+
+# unpack the results data frame, the list of models, and the RasterStack of raw predictions
+evalTbl         <- e@results
+evalMods        <- e@models
+names(evalMods) <- e@results$settings
+evalPreds       <- e@predictions
+```
+
+```{r}
+# view response curves for environmental variables with non-zero coefficients
+# dismo::response(evalMods[["L_1"]], var = c('bio01', 'bio02', 'bio03', 'bio04', 'bio05', 'bio07', 'bio08', 'bio09', 'bio12', 'bio13', 'bio14', 'bio15', 'bio16', 'bio17', 'bio18', 'bio19'))
+dismo::response(evalMods[["L_1"]], var = names(envs))
+```
+
+```{r}
+# view ENMeval results
+ENMeval::eval.plot(evalTbl, value = "avg.test.AUC")
+```
+
+```{r}
+# Select your model from the models list
+mod <- evalMods[["L_1"]]
+```
+
+```{r}
+# generate raw prediction
+pred <- evalPreds[["L_1"]]
+```
+
+```{r}
+# plot the model prediction
+plot(pred)
+
+pred_v <- values(pred)
+# TODO: use threshold(evaluate(p=p, a=a)) based on test data predictions
+table(pred_v > 0.01)
+table(pred_v > 0.1)
+table(pred_v > 0.5)
+```
+
+
+TODO:
+- limit background environmental sampling to similar depths or distance from shore
+- speed up by caching results, a la mx_rds
+- update Shiny app to use sdmpredictors
